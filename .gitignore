@@ -1,0 +1,7 @@
+.DS_Store
+.claude
+debug/
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb

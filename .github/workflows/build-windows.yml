@@ -1,0 +1,181 @@
+name: build-windows
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  PARTNER_CENTER_API: https://manage.devcenter.microsoft.com/v1.0/my/applications
+  PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+
+permissions:
+  contents: write
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        required: true
+        type: string
+        description: 'App name'
+      pkg:
+        required: true
+        type: string
+        description: 'Package name'
+      version:
+        required: true
+        type: string
+        description: 'Version to build'
+      build_store_package:
+        required: false
+        default: false
+        type: boolean
+        description: 'Build the unsigned Microsoft Store MSIX package'
+      publish_to_stores:
+        required: false
+        default: false
+        type: boolean
+        description: 'Publish to the Microsoft Partner Center account'
+
+jobs:
+  build-windows-app:
+    runs-on: windows-latest
+    outputs:
+      submission-success: ${{ steps.publish.outcome == 'success' }}
+    steps:
+      - name: Checkout private repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.ORG_TOKEN }}
+
+      - name: Install Microsoft Store publisher CLI
+        if: inputs.build_store_package || inputs.publish_to_stores
+        uses: microsoft/microsoft-store-apppublisher@v1.3
+      - name: Reconfigure Microsoft Store account
+        if: inputs.build_store_package || inputs.publish_to_stores
+        run: msstore reconfigure --tenantId ${{ secrets.PARTNER_TENANT }} --sellerId ${{ secrets.PARTNER_SELLER }} --clientId ${{ secrets.PARTNER_CLIENT }} --clientSecret ${{ secrets.PARTNER_SECRET }}
+
+      - name: Configure the Microsoft Store CLI
+        if: inputs.build_store_package || inputs.publish_to_stores
+        shell: pwsh
+        run: Install-Module -Name StoreBroker -Force
+
+      - name: Clean build artifacts
+        shell: bash
+        run: rm -rf build windows/.Dart_tool .dart_tool
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~\AppData\Local\Pub\Cache
+            ${{ env.FLUTTER_HOME }}\.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - name: Enable Windows desktop + native-assets
+        shell: bash
+        run: |
+          flutter config --enable-windows-desktop
+          flutter config --enable-native-assets
+
+
+      - name: Install Flutter dependencies
+        shell: bash
+        run: |
+          flutter pub get
+          flutter --version
+
+          
+
+      - name: Build Windows app
+        shell: bash
+        env:
+          CL: -D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+        run: |
+          set -xeuo pipefail
+          echo "Building ${{ inputs.name }} ${{ inputs.version }} (Release Mode)"
+          flutter build windows --release \
+            --obfuscate \
+            --split-debug-info=debug-info/windows-amd64 \
+            --suppress-analytics \
+            --no-tree-shake-icons
+
+      - name: Archive portable Windows build
+        shell: pwsh
+        run: |
+          $archive = "${{ inputs.name }}-windows-amd64-${{ inputs.version }}.zip"
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath $archive -Force
+          "WINDOWS_ZIP=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload portable Windows build to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Release ${{ inputs.version }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          files: ${{ env.WINDOWS_ZIP }}
+
+      - name: Compose MSIX env
+        if: inputs.build_store_package || inputs.publish_to_stores
+        shell: bash
+        run: |
+          set -xeuo pipefail
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
+          VERSION="${VERSION%%+*}"   # strip any existing +build suffix before MSIX x.y.z.w
+          IFS='.' read -r a b c <<< "$VERSION"
+          MSIX_VERSION="${a}.${b}.${c}.0"
+          MSIX_FILENAME="${{ inputs.name }}-windows-amd64-${{ inputs.version }}-store.msix"
+          echo "MSIX_VERSION=${MSIX_VERSION}" >> "${GITHUB_ENV}"
+          echo "MSIX_FILENAME=${MSIX_FILENAME}" >> "${GITHUB_ENV}"
+
+      - name: Build MSIX package (Store)
+        if: inputs.build_store_package || inputs.publish_to_stores
+        shell: bash
+        run: |
+          set -xeuo pipefail
+          DISPLAY_NAME="${{ secrets.PARTNER_APP }}"
+          DISPLAY_NAME="${DISPLAY_NAME##*.}"
+          dart run msix:create \
+            -e "internetClient, privateNetworkClientServer" \
+            -d "${DISPLAY_NAME}" \
+            -l "assets/logo.png" \
+            -u "${{ secrets.PARTNER_COMPANY }}" \
+            -i "${{ secrets.PARTNER_APP }}" \
+            --version "${MSIX_VERSION}" \
+            --publisher "${{ secrets.PARTNER_CN }}" \
+            --store true \
+            --trim-logo false \
+            --sign-msix false
+
+      - name: Move Store MSIX
+        if: inputs.build_store_package || inputs.publish_to_stores
+        shell: pwsh
+        run: |
+          Move-Item "build/windows/x64/runner/Release/*.msix" $env:MSIX_FILENAME
+          Get-Item $env:MSIX_FILENAME | Select-Object Name, Length
+
+      - name: Publish to Store
+        if: inputs.build_store_package || inputs.publish_to_stores
+        id: publish
+        continue-on-error: true
+        run: msstore publish '${{ env.MSIX_FILENAME }}' -id ${{ secrets.PARTNER_STORE }}
+
+      - name: Upload MSIX to release (Store publish failed)
+        if: (inputs.build_store_package || inputs.publish_to_stores) && steps.publish.outcome == 'failure'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Release ${{ inputs.version }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          files: ${{ env.MSIX_FILENAME }}
