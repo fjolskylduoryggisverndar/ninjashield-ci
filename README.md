@@ -1,4 +1,4 @@
-# BuddhaJumpApp/ninjashield-ci
+# fjolskylduoryggisverndar/ninjashield-ci
 
 > GitHub Actions pipeline for the NinjaShield Flutter VPN client: checks out the private app repo `fjolskylduoryggisverndar/ninjashield`, builds Android/iOS/macOS/Windows, publishes the download assets as GitHub Releases **on this repo**, and optionally pushes to Play internal / App Store Connect / TestFlight / Microsoft Store. A byte-for-byte fork of `BuddhaJumpApp/buddhajump-ci` minus two pieces (see §10).
 
@@ -18,7 +18,7 @@
 | **不是** | 源码仓库。源码在私有仓库 `fjolskylduoryggisverndar/ninjashield`，由 workflow 通过 `PRIVATE_REPO` + `ORG_TOKEN` 检出（`build.yml:44-48`）。改代码、改版本号都要去那边。 |
 | **不是** | 自动化的。虽然 `on:` 里写了 `repository_dispatch`，但实际没有可用的发送方（§2），每一次发版都是人手点 `workflow_dispatch`。 |
 
-三件套：`fjolskylduoryggisverndar/ninjashield`（源码，私有）→ **`BuddhaJumpApp/ninjashield-ci`（本仓库，公开）** → `fjolskylduoryggisverndar/ninjashield-web`（官网快照，域名 `ninjashield.xyz`）。
+三件套：`fjolskylduoryggisverndar/ninjashield`（源码，私有）→ **`fjolskylduoryggisverndar/ninjashield-ci`（本仓库，公开）** → `fjolskylduoryggisverndar/ninjashield-web`（官网快照，域名 `ninjashield.xyz`）。
 本仓库默认分支：`master`。当前最新 Release tag：`v1.2.6+126`。
 `.gitignore` 是 Rust 项目模板残留（`target/`、`Cargo.lock`、`*.rs.bk`），与本仓库内容无关。
 
@@ -38,7 +38,7 @@ on:
 
 **`repository_dispatch: pubspec-updated` 是死路。**
 
-- 发送方必须向 `api.github.com/repos/BuddhaJumpApp/ninjashield-ci/dispatches` POST `event_type: pubspec-updated`。
+- 发送方必须向 `api.github.com/repos/fjolskylduoryggisverndar/ninjashield-ci/dispatches` POST `event_type: pubspec-updated`。
 - 全估算里只有 `00000vpn`/`88888vpn` 两个源码仓库有会发这个事件的 `.github/workflows/ci.yml`（`ci.yml:58-63`，目标 `secrets.PUBLIC_REPO`），但它们的触发条件是 `push: branches: [master]`（`ci.yml:34-36`），而这两个仓库的默认分支是 `main`——push 永远打不中。其余源码仓库连 `.github/workflows/` 都没有。
 - 即便事件真的来了，`build.yml:68-69, 88-90` 把所有布尔输入包在 `github.event_name == 'workflow_dispatch' && inputs.xxx || false` 里，dispatch 触发的构建等价于「四个开关全关」。
 
@@ -163,19 +163,19 @@ on:
 
 ```bash
 # 普通发版：四平台构建，产物全部进本仓库 Release，AAB 自动进 Play internal
-gh workflow run build.yml --repo BuddhaJumpApp/ninjashield-ci --ref master
+gh workflow run build.yml --repo fjolskylduoryggisverndar/ninjashield-ci --ref master
 
 # 只把 iOS 推到 TestFlight（ipa 同时也会进 Release）
-gh workflow run build.yml --repo BuddhaJumpApp/ninjashield-ci --ref master \
+gh workflow run build.yml --repo fjolskylduoryggisverndar/ninjashield-ci --ref master \
   -f publish_ios_testflight=true
 
 # 正式提交商店
-gh workflow run build.yml --repo BuddhaJumpApp/ninjashield-ci --ref master \
+gh workflow run build.yml --repo fjolskylduoryggisverndar/ninjashield-ci --ref master \
   -f publish_to_stores=true
 
 # 看进度
-gh run list --repo BuddhaJumpApp/ninjashield-ci --workflow build.yml --limit 5
-gh run watch --repo BuddhaJumpApp/ninjashield-ci <run-id>
+gh run list --repo fjolskylduoryggisverndar/ninjashield-ci --workflow build.yml --limit 5
+gh run watch --repo fjolskylduoryggisverndar/ninjashield-ci <run-id>
 ```
 
 `--repo` 必须是 **ci 仓库**而不是源码仓库。运行前先确认 `fjolskylduoryggisverndar/ninjashield` 的 `pubspec.yaml` `version:` 已经改成新版本，否则会往**同一个 tag** 再传一遍（Windows/Apple 那几步 `overwrite_files: true` 会覆盖，Android 那步没有 `overwrite_files`）。
@@ -186,7 +186,7 @@ gh run watch --repo BuddhaJumpApp/ninjashield-ci <run-id>
 
 ## 7. 下载链路对本仓库的依赖
 
-官网 → `dl.ninjashield.xyz/android|windows` → Cloudflare Worker `fjolsky-downloads` → 302 → `edgeone.gh-proxy.org/https://github.com/BuddhaJumpApp/ninjashield-ci/releases/download/<tag>/<asset>`。
+官网 → `dl.ninjashield.xyz/android|windows` → Cloudflare Worker `fjolsky-downloads` → 302 → `edgeone.gh-proxy.org/https://github.com/fjolskylduoryggisverndar/ninjashield-ci/releases/download/<tag>/<asset>`。
 
 Worker 源码 `XTPU/cloudflare/workers/app-downloads.js`：
 
@@ -241,7 +241,7 @@ Worker 源码 `XTPU/cloudflare/workers/app-downloads.js`：
 8. **HEAD 不是 formatter-clean**：母版源码仓库上 `dart format --output=none --set-exit-if-changed lib` 会改 105 个文件里的 18 个；fork 源码同源，别跑 `dart format`。
 9. **fork 不带 sing-box 规则集、端点发现被短路**：kamevpn/00000vpn 源码仓库 `git ls-files assets/rules` 为 0；`lib/constants.dart:22-25` 的 `apiBaseUrl` 默认值非空，`lib/network.dart:171-174`、`lib/pages/landing.dart:119` 以 `isNotEmpty` 走「显式配置」分支，跳过 bit.ly → GitHub 发现链。这两点都与 CI 无关，但决定了产物的行为差异。
 10. **Actions 分钟数**：两个账号都是 Free 计划，公开仓库不计费。2026-09-07 `gh api` 按 GitHub 倍率（macOS ×10、Windows ×2）统计 30 天：一个 fork 一次四平台 `build` 折合 ≈132–143 计费分钟（aiglefree-ci：6 次 790 分钟）。转私有前先算清楚。
-11. **公开 Release URL 曾被当作举证材料**：`maskaura-ci` 的 `https://github.com/BuddhaJumpApp/maskaura-ci/releases` 被写进 Microsoft Defender 误报申诉（本地文件 `project/fjolsky/maskaura-false-positive-submission.md`）。ci 仓库转私有或改名会让这类举证失效。
+11. **公开 Release URL 曾被当作举证材料**：`maskaura-ci` 的 `https://github.com/fjolskylduoryggisverndar/maskaura-ci/releases` 被写进 Microsoft Defender 误报申诉（本地文件 `project/fjolsky/maskaura-false-positive-submission.md`）。ci 仓库转私有或改名会让这类举证失效。
 12. **Android JNA 两层锁**（源码仓库 `android/app/build.gradle.kts` 固定 `jna:5.17.0@aar`，`proguard-rules.pro` 有 `-keep class com.sun.jna.**`）、**macOS 主 App 不能带 `network.server`**（`macos/Runner/Release.entitlements` 注释）、**Win32 `Create()` 会先跑一次 `OnDestroy()`**（`windows/runner/flutter_window.cpp` 的守卫）——这三条在母版源码里有证据，fork 源码是从母版回移的，回移时别漏。
 
 ---
