@@ -37,6 +37,15 @@ on:
         default: false
         type: boolean
         description: 'Upload ONLY the macOS build to TestFlight. Requires APPLE_INSTALLER_PKCS12_BASE64/_PASSWORD (Mac Installer Distribution identity) — productbuild cannot sign the .pkg without it.'
+      # [2026-09-11 buddhajump-ci parity] ported from buddhajump-ci [2026-09-09 v1.7.5]:
+      # Packaging of the tunnel inside the Developer ID DMG.
+      # 'sysex' = Network System Extension (the only packet-tunnel form macOS
+      # accepts outside the App Store); 'skip' = build no DMG this run.
+      dmg_tunnel:
+        required: false
+        default: 'sysex'
+        type: string
+        description: "Developer ID DMG tunnel packaging: 'sysex' (default) or 'skip' (no DMG this run)"
 
 jobs:
   build-apple-app:
@@ -167,6 +176,450 @@ jobs:
             fi
           fi
 
+      # [2026-09-11 buddhajump-ci parity] The next three steps ("Build notarized
+      # DMG", "Upload DMG to GitHub release", "Publish to R2" for macOS) and the
+      # trailing "Fail the job if the DMG step failed" are ported from buddhajump-ci
+      # build-apple.yml (commits 90f3705, eefc3cb, 6335311, 722250a, 3e1ab9e,
+      # 8b58b77, e3b8ffb, 9701638, c2aa882). Only brand values differ: APP_GROUP,
+      # DIRECT_APP_NAME ("NinjaShield for Mac" -- it contains spaces, so it is set
+      # with plutil instead of a PlistBuddy command string, see phase 0) and the
+      # comments naming them. TEAM_ID YL6HJ6PT47 and DIRECT_SUFFIX 'direct' are
+      # the same as BuddhaJump's. The structural verification block is verbatim.
+      #
+      # ── Notarized DMG for distribution OUTSIDE the App Store ────────────────
+      # The .pkg this workflow already builds is signed "3rd Party Mac Developer
+      # Installer" -- that is a Mac App Store SUBMISSION format. A user who
+      # downloads it cannot install it, and the .app inside is signed "Apple
+      # Distribution", which Gatekeeper rejects outside the Store. Direct
+      # distribution needs a different certificate entirely (Developer ID
+      # Application), Hardened Runtime, and notarization.
+      #
+      # So the app is re-signed here rather than rebuilt: same bits, different
+      # identity. Signing runs inside-out (nested code first) because codesign
+      # seals what it contains -- signing the bundle first and its frameworks
+      # after invalidates the outer signature.
+      #
+      # Must sit BEFORE "Clean up keychain": that step deletes the keychain and
+      # the provisioning profiles this needs.
+      #
+      # Skipped silently when the Developer ID secrets are unset, so a repo
+      # without them still builds everything else.
+      # [2026-09-09 v1.7.5] The tunnel inside the DMG is now a Network SYSTEM
+      # Extension (Contents/Library/SystemExtensions/<id>.systemextension), not
+      # the ServiceExtension.appex the App Store build embeds: neagent refuses an
+      # app-extension NE provider signed with Developer ID ("Rejecting app
+      # extension provider ... Developer ID certificate") and TN3134 marks the
+      # packet-tunnel appex as App Store only. The .pkg path above is untouched:
+      # same Runner.app, same appex, same App Store profiles. The sysex is built
+      # here with xcodebuild from the SystemTunnel target AFTER `flutter build
+      # macos` (the project-level xcconfig includes the Flutter-generated one,
+      # which only exists after that build), then dropped into a COPY of the app,
+      # which is re-signed inside-out with the Developer ID identity and the
+      # DevID entitlements (macos/Runner/DeveloperID.entitlements +
+      # macos/SystemTunnel/SystemTunnel.entitlements). Every structural check
+      # fails LOUDLY rather than publish a DMG that installs but cannot connect;
+      # continue-on-error + the trailing "Fail the job" step keep the store
+      # uploads running while still turning the run red. `dmg_tunnel: skip`
+      # builds no DMG at all.
+      - name: Build notarized DMG (macOS direct distribution)
+        if: matrix.platform == 'macos'
+        id: dmg
+        continue-on-error: true
+        env:
+          DMG_TUNNEL: ${{ inputs.dmg_tunnel }}
+          TEAM_ID: YL6HJ6PT47
+          # The Developer ID copy is a SEPARATE app from the App Store one:
+          # bundle id <app id>.direct (com.fjolsky.ninjashield.direct), display name
+          # "NinjaShield for Mac", Team-ID app group -- so TestFlight and the .dmg can be
+          # installed side by side (same bundle id = same app to macOS, and TestFlight
+          # refused to install over the .dmg copy, BuddhaJump 2026-09-09 v1.8.0).
+          # APP_GROUP must equal, character for character, the group declared in the
+          # app repo's macos/Runner/DeveloperID.entitlements (asserted below, grep -qx).
+          APP_GROUP: YL6HJ6PT47.group.com.fjolsky.ninjashield
+          DIRECT_SUFFIX: direct
+          # Contains SPACES. It is written with plutil, which takes the value as its
+          # own argv entry, instead of inside a PlistBuddy -c command string (which
+          # PlistBuddy re-parses itself); every path built from it below is quoted,
+          # and phase 0 reads both keys back and fails unless they match exactly.
+          DIRECT_APP_NAME: "NinjaShield for Mac"
+        run: |
+          set -euo pipefail
+          # Guarded here rather than in `if:` -- a step-level `env:` is not yet
+          # in scope when its own `if:` is evaluated, and the secrets context is
+          # not available there at all.
+          if [ -z "${{ secrets.APPLE_DEVELOPER_ID_PKCS12_BASE64 }}" ]; then
+            echo "No Developer ID secrets configured; skipping the DMG."
+            exit 0
+          fi
+          # [2026-09-09 v1.7.5] operator escape hatch: no DMG this run.
+          case "${DMG_TUNNEL:-sysex}" in
+            sysex) ;;
+            skip)  echo "dmg_tunnel=skip: not building the Developer ID DMG this run."; exit 0 ;;
+            *)     echo "::error::dmg_tunnel must be 'sysex' or 'skip', got '${DMG_TUNNEL}'"; exit 1 ;;
+          esac
+          # [2026-09-11] was: set -x here. Moved below the three secret-bearing lines: owner rule is never to echo
+          # secrets, and GitHub's log masking is a fallback, not a control. xtrace resumes right after them.
+          KEYCHAIN=$RUNNER_TEMP/app-signing.keychain-db
+
+          # Developer ID identity, imported into the SAME keychain the build used.
+          DEVID_P12=$RUNNER_TEMP/DeveloperID.p12
+          echo -n "${{ secrets.APPLE_DEVELOPER_ID_PKCS12_BASE64 }}" | base64 -d -o $DEVID_P12
+          security import $DEVID_P12 -P "${{ secrets.APPLE_DEVELOPER_ID_PKCS12_PASSWORD }}" -A -t cert -f pkcs12 -k $KEYCHAIN
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "" $KEYCHAIN 2>/dev/null || true
+          DEVID_CERT=$(security find-identity -v -p codesigning $KEYCHAIN | grep "Developer ID Application" | head -1 | awk -F\" '{print $2}')
+          test -n "$DEVID_CERT"
+
+          # Developer ID provisioning profiles. The NetworkExtension entitlement
+          # is restricted, so each bundle needs a profile that grants it -- the
+          # App Store profiles installed earlier do not cover direct distribution.
+          PROF_DIR=$RUNNER_TEMP/devid-profiles
+          mkdir -p "$PROF_DIR"
+          echo -n "${{ secrets.APPLE_DEVID_PROVISIONING_BASE64 }}" | base64 -d | tar -xJf - -C "$PROF_DIR"
+          set -x  # [2026-09-11] xtrace back on — no secret is expanded below until notarization
+
+          APP_PATH=$(ls -d build/macos/Build/Products/Release/*.app)
+          APP_NAME=$(basename "$APP_PATH" .app)
+
+          # Work on a copy: the original .app may already have been turned into
+          # the TestFlight .pkg, and re-signing it would invalidate that.
+          WORK=$RUNNER_TEMP/dmgwork
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          ditto "$APP_PATH" "$WORK/$APP_NAME.app"
+          SIGN_APP="$WORK/$APP_NAME.app"
+
+          # [2026-09-09 v1.7.5 sysex] was (buddhajump-ci's appex path, retired -- neagent rejects it
+          # under Developer ID; kept as buddhajump-ci history, this repo never shipped it):
+          #   APPEX=$(find "$SIGN_APP" -name '*.appex' -maxdepth 4 | head -1 || true)
+          #   cp "$PROF_DIR/BuddhaJump_DevID_macOS.provisionprofile" "$SIGN_APP/Contents/embedded.provisionprofile"
+          #   if [ -n "$APPEX" ]; then
+          #     cp "$PROF_DIR/BuddhaJump_Service_DevID_macOS.provisionprofile" "$APPEX/Contents/embedded.provisionprofile"
+          #   fi
+
+          # ── 0. Re-identify the copy as the direct-download app ──
+          # CFBundleIdentifier <app id>.direct, name/display name "NinjaShield for Mac", bundle
+          # folder "NinjaShield for Mac.app". FlutterBridge derives the sysex id and app group
+          # from the bundle id at runtime and Dart asks it which channel it is (Stripe instead
+          # of Apple IAP), so nothing else in the app needs to know. The executable name and
+          # the .dmg file name (ninjashield-macos-<tag>.dmg -- what the dl.* Worker serves for
+          # prefix "ninjashield") stay as they are.
+          PB=/usr/libexec/PlistBuddy
+          STORE_APP_ID=$($PB -c 'Print :CFBundleIdentifier' "$SIGN_APP/Contents/Info.plist")
+          $PB -c "Set :CFBundleIdentifier $STORE_APP_ID.$DIRECT_SUFFIX" "$SIGN_APP/Contents/Info.plist"
+          # [2026-09-11 buddhajump-ci parity] was (buddhajump-ci form, written for the one-word
+          # BuddhaJumpWall; the value travels inside PlistBuddy's -c command string, which
+          # PlistBuddy tokenizes itself. A local test on macOS 27.0 kept "NinjaShield for Mac"
+          # whole for both Set and Add, but a multi-word value should not depend on that
+          # tokenizer, so it now goes through plutil as its own argument, with a read-back):
+          #   $PB -c "Set :CFBundleName $DIRECT_APP_NAME" "$SIGN_APP/Contents/Info.plist" || $PB -c "Add :CFBundleName string $DIRECT_APP_NAME" "$SIGN_APP/Contents/Info.plist"
+          #   $PB -c "Set :CFBundleDisplayName $DIRECT_APP_NAME" "$SIGN_APP/Contents/Info.plist" || $PB -c "Add :CFBundleDisplayName string $DIRECT_APP_NAME" "$SIGN_APP/Contents/Info.plist"
+          # plutil takes the value as its own argument and -replace creates the key when it
+          # is absent, so no Set || Add fallback is needed.
+          plutil -replace CFBundleName -string "$DIRECT_APP_NAME" "$SIGN_APP/Contents/Info.plist"
+          plutil -replace CFBundleDisplayName -string "$DIRECT_APP_NAME" "$SIGN_APP/Contents/Info.plist"
+          mv "$SIGN_APP" "$WORK/$DIRECT_APP_NAME.app"
+          SIGN_APP="$WORK/$DIRECT_APP_NAME.app"
+          APP_NAME="$DIRECT_APP_NAME"
+          [ "$($PB -c 'Print :CFBundleIdentifier' "$SIGN_APP/Contents/Info.plist")" = "$STORE_APP_ID.$DIRECT_SUFFIX" ] || { echo "::error::failed to re-identify the direct copy"; exit 1; }
+          # [2026-09-11 buddhajump-ci parity] read-back: both names must be the exact
+          # multi-word string, not a truncated first word.
+          [ "$($PB -c 'Print :CFBundleName' "$SIGN_APP/Contents/Info.plist")" = "$DIRECT_APP_NAME" ] \
+            || { echo "::error::CFBundleName is '$($PB -c 'Print :CFBundleName' "$SIGN_APP/Contents/Info.plist" 2>/dev/null || true)', expected '$DIRECT_APP_NAME'"; exit 1; }
+          [ "$($PB -c 'Print :CFBundleDisplayName' "$SIGN_APP/Contents/Info.plist")" = "$DIRECT_APP_NAME" ] \
+            || { echo "::error::CFBundleDisplayName is '$($PB -c 'Print :CFBundleDisplayName' "$SIGN_APP/Contents/Info.plist" 2>/dev/null || true)', expected '$DIRECT_APP_NAME'"; exit 1; }
+
+          # ── [2026-09-09 v1.7.5] 1. Build the SystemTunnel target (unsigned here; signed
+          # below with the same inside-out codesign the rest of the bundle gets). A
+          # separate derived-data dir keeps build/macos/Build/Products/Release, where the
+          # .pkg and this copy come from, byte-identical to today. ──
+          APP_ID=$($PB -c 'Print :CFBundleIdentifier' "$SIGN_APP/Contents/Info.plist")
+          APP_VER=$($PB -c 'Print :CFBundleShortVersionString' "$SIGN_APP/Contents/Info.plist")
+          APP_BUILD=$($PB -c 'Print :CFBundleVersion' "$SIGN_APP/Contents/Info.plist")
+          SYSEX_DD=$RUNNER_TEMP/sysex-derived
+          rm -rf "$SYSEX_DD"
+          xcodebuild -list -project macos/Runner.xcodeproj | grep -q 'SystemTunnel' \
+            || { echo "::error::macos/Runner.xcodeproj has no SystemTunnel target (app repo too old for the sysex DMG)"; exit 1; }
+          # -scheme, not -target: xcodebuild refuses -derivedDataPath with -target
+          # ("The flag -scheme ... is required when specifying -derivedDataPath",
+          # first run 2026-09-08). SystemTunnel.xcscheme is shared in the app repo.
+          # -workspace mirrors `flutter build macos` (same SwiftPM package resolution path).
+          xcodebuild -workspace macos/Runner.xcworkspace -scheme SystemTunnel -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$SYSEX_DD" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO build
+          SYSEX_BUILT=$(find "$SYSEX_DD/Build/Products/Release" -maxdepth 1 -name '*.systemextension' -type d | head -1 || true)
+          if [ -z "$SYSEX_BUILT" ]; then
+            echo "::error::SystemTunnel target produced no .systemextension under $SYSEX_DD/Build/Products/Release"
+            exit 1
+          fi
+          SYSEX_ID=$($PB -c 'Print :CFBundleIdentifier' "$SYSEX_BUILT/Contents/Info.plist")
+          SYSEX_PKG=$($PB -c 'Print :CFBundlePackageType' "$SYSEX_BUILT/Contents/Info.plist")
+          SYSEX_CLASS=$($PB -c 'Print :NetworkExtension:NEProviderClasses:com.apple.networkextension.packet-tunnel' "$SYSEX_BUILT/Contents/Info.plist" 2>/dev/null || true)
+          case "$SYSEX_ID" in "$APP_ID".*) ;; *) echo "::error::sysex bundle id '$SYSEX_ID' is not a child of '$APP_ID'"; exit 1 ;; esac
+          [ "$SYSEX_PKG" = "SYSX" ] || { echo "::error::sysex CFBundlePackageType is '$SYSEX_PKG', expected SYSX"; exit 1; }
+          [ -n "$SYSEX_CLASS" ] || { echo "::error::sysex Info.plist lacks NetworkExtension/NEProviderClasses/com.apple.networkextension.packet-tunnel"; exit 1; }
+          if $PB -c 'Print :NSExtension' "$SYSEX_BUILT/Contents/Info.plist" >/dev/null 2>&1; then
+            echo "::error::sysex Info.plist still carries an NSExtension dict (activation fails with validationFailed)"; exit 1
+          fi
+          [ "$(basename "$SYSEX_BUILT")" = "$SYSEX_ID.systemextension" ] || { echo "::error::sysex product is '$(basename "$SYSEX_BUILT")'; must be '<bundle id>.systemextension'"; exit 1; }
+          test -f "$SYSEX_BUILT/Contents/Frameworks/librainbox.dylib" || { echo "::error::sysex has no Contents/Frameworks/librainbox.dylib -- engine not embedded"; exit 1; }
+          # [v1.7.6] the extension seeds its rule-sets from its own bundle (root cannot read the
+          # user's App Group container); a build without them would start and then fail on
+          # every "rules/<file>.srs" the config references.
+          RULES_N=$(ls "$SYSEX_BUILT/Contents/Resources/rules"/*.srs 2>/dev/null | wc -l | tr -d ' ')
+          [ "${RULES_N:-0}" -ge 30 ] || { echo "::error::sysex bundles only ${RULES_N:-0} rule-sets under Contents/Resources/rules (expected >= 30)"; exit 1; }
+          SYSEX_VER=$($PB -c 'Print :CFBundleShortVersionString' "$SYSEX_BUILT/Contents/Info.plist")
+          SYSEX_BUILD=$($PB -c 'Print :CFBundleVersion' "$SYSEX_BUILT/Contents/Info.plist")
+          if [ "$SYSEX_VER/$SYSEX_BUILD" != "$APP_VER/$APP_BUILD" ]; then
+            echo "::error::sysex version $SYSEX_VER ($SYSEX_BUILD) != app $APP_VER ($APP_BUILD) -- OSSystemExtensionManager keys upgrades on these"; exit 1
+          fi
+          SYSEX_EXE="$SYSEX_BUILT/Contents/MacOS/$($PB -c 'Print :CFBundleExecutable' "$SYSEX_BUILT/Contents/Info.plist")"
+          APP_EXE="$SIGN_APP/Contents/MacOS/$($PB -c 'Print :CFBundleExecutable' "$SIGN_APP/Contents/Info.plist")"
+          [ "$(lipo -archs "$SYSEX_EXE" | tr ' ' '\n' | sort | tr '\n' ' ')" = "$(lipo -archs "$APP_EXE" | tr ' ' '\n' | sort | tr '\n' ' ')" ] \
+            || { echo "::error::arch mismatch: sysex [$(lipo -archs "$SYSEX_EXE")] vs app [$(lipo -archs "$APP_EXE")]"; exit 1; }
+
+          # ── 2. Assemble: drop the appex, add the sysex ──
+          # The appex is removed, not kept: it can never run under Developer ID,
+          # it would duplicate the engine in the DMG, and FlutterBridge decides
+          # "sysex mode" purely from the presence of the SystemExtensions dir.
+          rm -rf "$SIGN_APP/Contents/PlugIns/ServiceExtension.appex"
+          rmdir "$SIGN_APP/Contents/PlugIns" 2>/dev/null || true
+          test ! -e "$SIGN_APP/Contents/PlugIns/ServiceExtension.appex"
+          mkdir -p "$SIGN_APP/Contents/Library/SystemExtensions"
+          SYSEX="$SIGN_APP/Contents/Library/SystemExtensions/$(basename "$SYSEX_BUILT")"
+          rm -rf "$SYSEX"
+          ditto "$SYSEX_BUILT" "$SYSEX"
+
+          # ── 3. Provisioning profiles, chosen by CONTENT, not by file name ──
+          # A profile is only usable if its application-identifier matches the
+          # bundle it is embedded in AND it grants what the entitlements claim.
+          # A stale APPLE_DEVID_PROVISIONING_BASE64 (no system-extension.install,
+          # no sysex id) therefore fails here, not at the user's first click.
+          prof_ent() { security cms -D -i "$1" 2>/dev/null > "$RUNNER_TEMP/prof.plist" && $PB -c "Print :Entitlements:$2" "$RUNNER_TEMP/prof.plist" 2>/dev/null; }
+          pick_profile() {   # $1 = application-identifier wanted; $2.. = entitlement keys that must be present
+            local want="$1"; shift
+            local p k ok
+            for p in "$PROF_DIR"/*.provisionprofile; do
+              [ "$(prof_ent "$p" com.apple.application-identifier)" = "$want" ] || continue
+              ok=1
+              for k in "$@"; do prof_ent "$p" "$k" >/dev/null || ok=0; done
+              [ "$ok" = 1 ] && { echo "$p"; return 0; }
+            done
+            return 1
+          }
+          APP_PROFILE=$(pick_profile "$TEAM_ID.$APP_ID" com.apple.developer.system-extension.install) \
+            || { echo "::error::no Developer ID profile for $APP_ID granting com.apple.developer.system-extension.install -- enable SYSTEM_EXTENSION_INSTALL on the App ID, recreate the profile, update APPLE_DEVID_PROVISIONING_BASE64"; exit 1; }
+          SYSEX_PROFILE=$(pick_profile "$TEAM_ID.$SYSEX_ID" com.apple.developer.networking.networkextension) \
+            || { echo "::error::no Developer ID profile for $SYSEX_ID in APPLE_DEVID_PROVISIONING_BASE64"; exit 1; }
+          prof_ent "$SYSEX_PROFILE" com.apple.developer.networking.networkextension | grep -q 'packet-tunnel-provider-systemextension' \
+            || { echo "::error::$(basename "$SYSEX_PROFILE") does not grant packet-tunnel-provider-systemextension"; exit 1; }
+          echo "profiles: app=$(basename "$APP_PROFILE") sysex=$(basename "$SYSEX_PROFILE")"
+          cp "$APP_PROFILE"   "$SIGN_APP/Contents/embedded.provisionprofile"
+          cp "$SYSEX_PROFILE" "$SYSEX/Contents/embedded.provisionprofile"
+
+          # ── 4. Sign inside-out: dylibs/frameworks (incl. the one inside the sysex),
+          # then the sysex with its entitlements, then the app. --options runtime is
+          # Hardened Runtime, which notarization requires. ──
+          find "$SIGN_APP" \( -name '*.dylib' -o -name '*.framework' \) -print0 |
+            xargs -0 -I{} codesign --force --timestamp --options runtime --sign "$DEVID_CERT" {}
+          # [2026-09-09 v1.7.5 sysex] was:
+          #   if [ -n "$APPEX" ]; then
+          #     codesign --force --timestamp --options runtime \
+          #       --entitlements macos/ServiceExtension/ServiceExtension.entitlements \
+          #       --sign "$DEVID_CERT" "$APPEX"
+          #   fi
+          codesign --force --timestamp --options runtime \
+            --entitlements macos/SystemTunnel/SystemTunnel.entitlements \
+            --sign "$DEVID_CERT" "$SYSEX"
+          # [2026-09-09 v1.7.5 sysex] was: --entitlements macos/Runner/Release.entitlements
+          # (the App Store set claims appex-style "packet-tunnel-provider", which no
+          # Developer ID profile grants; DeveloperID.entitlements claims the
+          # -systemextension variant + system-extension.install + the identifiers
+          # Xcode would otherwise inject).
+          codesign --force --timestamp --options runtime \
+            --entitlements macos/Runner/DeveloperID.entitlements \
+            --sign "$DEVID_CERT" "$SIGN_APP"
+
+          # ── 5. Verify what was signed against what the profiles grant ──
+          codesign --verify --deep --strict --verbose=2 "$SIGN_APP"
+          codesign --verify --strict --verbose=2 "$SYSEX"
+          ents() { codesign -d --entitlements :- "$1" 2>/dev/null > "$RUNNER_TEMP/ents.plist"; $PB -c "Print :$2" "$RUNNER_TEMP/ents.plist" 2>/dev/null; }
+          [ "$(ents "$SIGN_APP" com.apple.application-identifier)" = "$TEAM_ID.$APP_ID" ] \
+            || { echo "::error::app application-identifier != $TEAM_ID.$APP_ID"; exit 1; }
+          [ "$(ents "$SIGN_APP" com.apple.developer.system-extension.install)" = "true" ] \
+            || { echo "::error::app lacks com.apple.developer.system-extension.install"; exit 1; }
+          ents "$SIGN_APP" com.apple.developer.networking.networkextension | grep -q 'packet-tunnel-provider-systemextension' \
+            || { echo "::error::app NE entitlement lacks packet-tunnel-provider-systemextension"; exit 1; }
+          if ents "$SIGN_APP" com.apple.developer.networking.networkextension | grep -qE '^ *packet-tunnel-provider$'; then
+            echo "::error::app still claims appex-style packet-tunnel-provider, which Developer ID cannot grant"; exit 1
+          fi
+          ents "$SIGN_APP" com.apple.security.application-groups | grep -qx " *$APP_GROUP" || { echo "::error::app lacks app group $APP_GROUP"; exit 1; }
+          [ "$(ents "$SYSEX" com.apple.application-identifier)" = "$TEAM_ID.$SYSEX_ID" ] \
+            || { echo "::error::sysex application-identifier != $TEAM_ID.$SYSEX_ID"; exit 1; }
+          ents "$SYSEX" com.apple.developer.networking.networkextension | grep -q 'packet-tunnel-provider-systemextension' \
+            || { echo "::error::sysex lacks packet-tunnel-provider-systemextension"; exit 1; }
+          if ents "$SYSEX" com.apple.security.app-sandbox >/dev/null 2>&1; then
+            echo "::error::sysex is sandboxed -- it must write the user's App Group directory as root, so it must NOT carry app-sandbox"; exit 1
+          fi
+          codesign -dvv "$SIGN_APP" 2>&1 | grep -q 'Authority=Developer ID Application' || { echo "::error::app is not signed with Developer ID Application"; exit 1; }
+          codesign -dvv "$SYSEX" 2>&1 | grep -q 'flags=.*runtime' || { echo "::error::sysex not signed with Hardened Runtime"; exit 1; }
+          echo "sysex $SYSEX_ID ($SYSEX_VER/$SYSEX_BUILD) as $(basename "$SYSEX"); app $APP_ID ($APP_VER/$APP_BUILD)"
+
+          # A drag-install DMG: the app plus a link to /Applications.
+          STAGE=$RUNNER_TEMP/dmgstage
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          ditto "$SIGN_APP" "$STAGE/$APP_NAME.app"
+          ln -s /Applications "$STAGE/Applications"
+          DMG_PATH="build/macos/${{ inputs.name }}-macos-${{ inputs.version }}.dmg"
+          rm -f "$DMG_PATH"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG_PATH"
+          codesign --force --timestamp --sign "$DEVID_CERT" "$DMG_PATH"
+
+          # Notarize. Without this Gatekeeper still refuses the download, and the
+          # ticket is stapled so the app opens even on a machine that is offline.
+          set +x  # [2026-09-11] no xtrace while the App Store Connect API key is written and used
+          mkdir -p ~/private_keys
+          echo -n "${{ secrets.APPLE_API_KEY_BASE64 }}" | base64 -d > ~/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
+          chmod 600 ~/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
+          # 90m, not 30m: Apple's queue is unpredictable and the FIRST submission
+          # from a new Developer ID is the slowest of all -- the 2026-09-01 run
+          # was still "In Progress" when a 30m timeout cut it off, with the
+          # signing and packaging already correct.
+          set +e
+          xcrun notarytool submit "$DMG_PATH" \
+            --key ~/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8 \
+            --key-id "${{ secrets.APPLE_API_KEY_ID }}" \
+            --issuer "${{ secrets.APPLE_API_ISSUER_ID }}" \
+            --wait --timeout 90m
+          NOTARY_RC=$?
+          if [ $NOTARY_RC -eq 0 ]; then
+            xcrun stapler staple "$DMG_PATH"
+            STAPLE_RC=$?
+          else
+            STAPLE_RC=1
+          fi
+          set -e
+          rm -rf ~/private_keys
+          set -x  # [2026-09-11] xtrace back on
+
+          # An un-notarized DMG is worse than no DMG: Gatekeeper refuses it, and
+          # a user who downloads one concludes the app is broken. So publish it
+          # only when the ticket is actually stapled -- but do NOT fail the job,
+          # because the .zip/.pkg this run also produced are unaffected and a
+          # slow Apple queue is not a build error.
+          if [ $NOTARY_RC -eq 0 ] && [ $STAPLE_RC -eq 0 ]; then
+            # Proof, not assumption: the same evaluation a user's Mac performs.
+            spctl -a -vvv -t install "$DMG_PATH" || true
+            # [2026-09-09 v1.7.5] and the app as Gatekeeper assesses it after the
+            # drag-install (ticket looked up online; the staple lives on the DMG).
+            spctl -a -t exec -vv "$SIGN_APP" || echo "::warning::spctl did not accept $APP_NAME.app as a notarized Developer ID app (online ticket lookup may lag); the stapled DMG above was accepted"
+            echo "DMG_PATH=$DMG_PATH" >> "$GITHUB_ENV"
+            echo "DMG ready: notarized and stapled, tunnel = system extension $SYSEX_ID."
+          else
+            echo "::warning::Notarization did not complete (notarytool rc=$NOTARY_RC, stapler rc=$STAPLE_RC). The DMG was built and signed but is NOT published, because an un-stapled DMG is rejected by Gatekeeper. Re-run this workflow; Apple's queue is usually faster on later submissions."
+          fi
+
+      - name: Upload DMG to GitHub release
+        if: matrix.platform == 'macos' && env.DMG_PATH != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Release ${{ inputs.version }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          files: ${{ env.DMG_PATH }}
+
+
+      # [2026-09-07] Mirror the artifact into the fjolsky-downloads R2 bucket so
+      # dl.<brand>/macos serves it from our own account (the Worker falls back
+      # to this GitHub release only while R2 has no manifest). Additive:
+      # continue-on-error, never blocks the release. Secrets: CLOUDFLARE_ACCOUNT_ID,
+      # CLOUDFLARE_R2_TOKEN (R2-only token), R2_BUCKET. The app slug is the part of
+      # PRIVATE_REPO after the slash (NOT inputs.name, which is vpn00000 for
+      # 00000vpn). Keeps the two newest tags per app plus anything a latest/*.json
+      # still points at, so the bucket stays inside the R2 free tier. A re-run of an
+      # OLD release uploads its object but never repoints dl.* backwards.
+      # Source of truth: XTPU/cloudflare/ci-r2-upload-step.yml.
+      - name: Publish to R2 (dl.<brand> direct downloads)
+        if: matrix.platform == 'macos' && env.DMG_PATH != ''
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        env:
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          TAG: ${{ inputs.version }}
+          PLATFORM: macos
+          FILE: ${{ env.DMG_PATH }}
+          KEEP_TAGS: "2"
+        run: |
+          set -euo pipefail
+          APP="${PRIVATE_REPO:-}"; APP=$(printf %s "${APP#*/}" | tr 'A-Z' 'a-z')
+          if [ -z "${CF_R2_TOKEN:-}" ] || [ -z "${CF_ACCOUNT:-}" ] || [ -z "${R2_BUCKET:-}" ] || [ -z "$APP" ] || [ -z "${FILE:-}" ]; then echo "R2 not configured or no file; skipping."; exit 0; fi
+          FILE="${FILE//\\//}"
+          [ -f "$FILE" ] || { echo "artifact not found: $FILE"; exit 0; }
+          PY=$(command -v python3 || command -v python)
+          case "$PLATFORM" in
+            android) CT=application/vnd.android.package-archive;;
+            windows) CT=application/zip;;
+            macos)   CT=application/x-apple-diskimage;;
+            *) echo "unknown PLATFORM=$PLATFORM"; exit 0;;
+          esac
+          API="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/r2/buckets/$R2_BUCKET"
+          AUTH="Authorization: Bearer $CF_R2_TOKEN"
+          enc() { "$PY" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="/"))' "$1" | tr -d '\r'; }
+          NAME=$(basename "$FILE"); KEY="$APP/$TAG/$NAME"
+          SIZE=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE")
+          SHA=$( (sha256sum "$FILE" 2>/dev/null || shasum -a 256 "$FILE") | cut -d' ' -f1)
+          # 1) the bytes
+          curl -fsS -m 1200 -X PUT "$API/objects/$(enc "$KEY")" -H "$AUTH" -H "Content-Type: $CT" --upload-file "$FILE" >/dev/null
+          echo "R2: uploaded $KEY ($((SIZE/1048576)) MB)"
+          # 2) the manifest -- unless the one already there points at a NEWER tag
+          curl -fsS -m 120 "$API/objects/$(enc "$APP/latest/$PLATFORM.json")" -H "$AUTH" -o r2-current.json 2>/dev/null || echo '{}' > r2-current.json
+          if "$PY" - "$TAG" <<'PYEOF'
+          import json,re,sys
+          def v(t):
+              m=re.match(r"v?(\d+)\.(\d+)\.(\d+)(?:\+(\d+))?$",t or ""); return tuple(int(x or 0) for x in m.groups()) if m else None
+          try: cur=json.load(open("r2-current.json")).get("tag")
+          except Exception: cur=None
+          new=sys.argv[1]
+          sys.exit(1 if (v(cur) and v(new) and v(cur)>v(new)) else 0)
+          PYEOF
+          then
+            printf '{"tag":"%s","key":"%s","size":%s,"sha256":"%s","content_type":"%s","published_at":"%s","source":"github-actions %s"}\n' \
+              "$TAG" "$KEY" "$SIZE" "$SHA" "$CT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GITHUB_RUN_ID" > r2-manifest.json
+            curl -fsS -m 120 -X PUT "$API/objects/$(enc "$APP/latest/$PLATFORM.json")" -H "$AUTH" -H "Content-Type: application/json" --upload-file r2-manifest.json >/dev/null
+            echo "R2: $APP/latest/$PLATFORM.json -> $TAG"
+          else
+            echo "R2: NOT repointing $APP/latest/$PLATFORM.json (it points at a newer tag than $TAG); object uploaded only"
+          fi
+          # 3) prune: keep the KEEP_TAGS newest tags (by last_modified) plus every tag a latest/*.json references
+          curl -fsS -m 120 "$API/objects?prefix=$(enc "$APP/")&per_page=1000" -H "$AUTH" > r2-listing.json
+          for p in android windows macos; do curl -fsS -m 120 "$API/objects/$(enc "$APP/latest/$p.json")" -H "$AUTH" -o "r2-ref-$p.json" 2>/dev/null || echo '{}' > "r2-ref-$p.json"; done
+          "$PY" - "$APP" "$TAG" "$KEEP_TAGS" > r2-prune.txt <<'PYEOF'
+          import json,sys,collections
+          app,newtag,keep=sys.argv[1],sys.argv[2],int(sys.argv[3])
+          objs=json.load(open("r2-listing.json")).get("result",[])
+          protected={newtag}
+          for p in ("android","windows","macos"):
+              try: t=json.load(open("r2-ref-%s.json"%p)).get("tag")
+              except Exception: t=None
+              if t: protected.add(t)
+          bytag=collections.defaultdict(list); newest={}
+          for o in objs:
+              parts=o["key"].split("/")
+              if len(parts)<3 or parts[1]=="latest": continue
+              ts=o.get("last_modified") or o.get("uploaded") or ""
+              bytag[parts[1]].append(o["key"]); newest[parts[1]]=max(newest.get(parts[1],""),ts)
+          order=sorted(bytag,key=lambda t:(t in protected,newest[t]),reverse=True)
+          for t in order[keep:]:
+              if t in protected: continue
+              for k in bytag[t]: print(k)
+          PYEOF
+          while read -r k; do k="${k%$'\r'}"; [ -z "$k" ] && continue; curl -fsS -m 120 -X DELETE "$API/objects/$(enc "$k")" -H "$AUTH" >/dev/null && echo "pruned $k" || echo "prune skipped $k"; done < r2-prune.txt
+
       - name: Clean up keychain
         if: always()
         run: |
@@ -206,3 +659,14 @@ jobs:
       - name: Clean up API key
         if: always() && (inputs.publish_to_stores || (inputs.publish_ios_testflight && matrix.platform == 'ios') || (inputs.publish_macos_testflight && matrix.platform == 'macos'))
         run: rm -rf ~/private_keys
+
+      # [2026-09-11 buddhajump-ci parity] ported from buddhajump-ci [2026-09-09 v1.7.5].
+      # Loud failure, placed AFTER the store uploads: the DMG
+      # step runs with continue-on-error so a system-extension / signing problem
+      # can never skip the .pkg/.ipa upload, but the run must still go red and
+      # nothing reaches R2/GitHub for macOS direct download (DMG_PATH stays empty).
+      - name: Fail the job if the DMG step failed
+        if: always() && matrix.platform == 'macos' && steps.dmg.outcome == 'failure'
+        run: |
+          echo "::error::'Build notarized DMG' failed (system-extension build/assembly, profiles, signing or verification). No macOS DMG was published."
+          exit 1
